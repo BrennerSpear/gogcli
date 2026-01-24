@@ -84,10 +84,15 @@ type DriveLsCmd struct {
 	Page      string `name:"page" aliases:"cursor" help:"Page token"`
 	Query     string `name:"query" help:"Drive query filter"`
 	Parent    string `name:"parent" help:"Folder ID to list (default: root)"`
+	All       bool   `name:"all" aliases:"global" help:"List all accessible files (mutually exclusive with --parent)"`
 	AllDrives bool   `name:"all-drives" help:"Include shared drives (default: true; use --no-all-drives for My Drive only)" default:"true" negatable:"_"`
 }
 
 func (c *DriveLsCmd) Run(ctx context.Context, flags *RootFlags) error {
+	if c.All && strings.TrimSpace(c.Parent) != "" {
+		return usage("--all cannot be combined with --parent")
+	}
+
 	u := ui.FromContext(ctx)
 	account, err := requireAccount(flags)
 	if err != nil {
@@ -104,7 +109,12 @@ func (c *DriveLsCmd) Run(ctx context.Context, flags *RootFlags) error {
 		return err
 	}
 
-	q := buildDriveListQuery(folderID, c.Query)
+	var q string
+	if c.All {
+		q = buildDriveAllListQuery(c.Query)
+	} else {
+		q = buildDriveListQuery(folderID, c.Query)
+	}
 
 	// Include files from shared drives, not just personal "My Drive"
 	call := svc.Files.List().
@@ -981,6 +991,17 @@ func buildDriveListQuery(folderID string, userQuery string) string {
 		q = q + " and " + parent
 	} else {
 		q = parent
+	}
+	if !hasDriveTrashedPredicate(q) {
+		q += " and trashed = false"
+	}
+	return q
+}
+
+func buildDriveAllListQuery(userQuery string) string {
+	q := strings.TrimSpace(userQuery)
+	if q == "" {
+		return "trashed = false"
 	}
 	if !hasDriveTrashedPredicate(q) {
 		q += " and trashed = false"
