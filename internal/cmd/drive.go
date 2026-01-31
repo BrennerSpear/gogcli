@@ -1120,10 +1120,15 @@ func guessMimeType(path string) string {
 
 func downloadDriveFile(ctx context.Context, svc *drive.Service, meta *drive.File, destPath string, format string) (string, int64, error) {
 	isGoogleDoc := strings.HasPrefix(meta.MimeType, "application/vnd.google-apps.")
-	origFormat := format
-	format = strings.ToLower(strings.TrimSpace(format))
+	normalizedFormat := strings.ToLower(strings.TrimSpace(format))
+	if normalizedFormat == "auto" {
+		normalizedFormat = ""
+	}
 
-	if fileFormatErr := validateDriveDownloadFormatForFile(meta, origFormat); fileFormatErr != nil {
+	if !isGoogleDoc && normalizedFormat != "" {
+		return "", 0, fmt.Errorf("--format %q not supported for non-Google Workspace files (mimeType=%q); file can only be downloaded as-is", format, meta.MimeType)
+	}
+	if fileFormatErr := validateDriveDownloadFormatForFile(meta, format); fileFormatErr != nil {
 		return "", 0, fileFormatErr
 	}
 
@@ -1135,11 +1140,11 @@ func downloadDriveFile(ctx context.Context, svc *drive.Service, meta *drive.File
 
 	if isGoogleDoc {
 		var exportMimeType string
-		if format == "" {
+		if normalizedFormat == "" {
 			exportMimeType = driveExportMimeType(meta.MimeType)
 		} else {
 			var mimeErr error
-			exportMimeType, mimeErr = driveExportMimeTypeForFormat(meta.MimeType, format)
+			exportMimeType, mimeErr = driveExportMimeTypeForFormat(meta.MimeType, normalizedFormat)
 			if mimeErr != nil {
 				return "", 0, mimeErr
 			}
@@ -1239,7 +1244,7 @@ func driveExportMimeType(googleMimeType string) string {
 
 func driveExportMimeTypeForFormat(googleMimeType string, format string) (string, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
-	if format == "" {
+	if format == "" || format == "auto" {
 		return driveExportMimeType(googleMimeType), nil
 	}
 
