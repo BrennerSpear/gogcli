@@ -1,137 +1,224 @@
-# PRD: Drafts-Only Mode (`--no-send`)
+# PRD: Write Safety Levels
 
 ## Problem
 
-When gog is used by AI agents or automation, there's no way to grant write access while preventing outbound messages. An agent authorized with `gmail.modify` can search, read, organize mail, **and** send emails — all with the same token. Google doesn't offer a "drafts only" OAuth scope; `gmail.compose` still includes send.
+When gog is used by AI agents or automation, operators need granular control over what write operations are allowed. The existing `--readonly` flag is all-or-nothing: either full read-only (no writes at all) or full read-write (can send emails, delete files, modify settings). There's no middle ground.
 
-Operators need a CLI-level guardrail: full read/write for internal operations, but hard-blocked on anything that sends a message to another person.
+Operators need tiered safety levels: "let the agent organize my inbox and draft emails, but never actually send one."
 
-## Goal
+## Design: Safety Levels 0–4
 
-Add a `--no-send` mode that blocks outbound message operations at the CLI level while preserving all other read/write functionality.
+Five levels from most restrictive to fully open. Each level is a **preset** that sets per-service write permissions. Operators can also override individual services.
 
-## Scope
+### Level 0: Read-Only (existing `--readonly`)
 
-### Services with outbound operations (messages that reach other people)
+No writes to any service. Already implemented via `--readonly` / `--gmail-scope=readonly` / `--drive-scope=readonly`.
 
-| Service | Outbound commands | Blocked in `--no-send` |
-|---------|------------------|----------------------|
-| **Gmail** | `gmail send`, `gmail drafts send`, top-level `send` | ✅ Blocked |
-| **Chat** | `chat messages send`, `chat dm send` | ✅ Blocked |
+### Level 1: Draft & Organize
 
-### Services with NO outbound operations (self-contained writes)
+Write to your own workspace. Create drafts. Organize existing items. **Nothing outbound — no messages reach other people.**
 
-These modify your own data only — no message leaves your account:
+| Service | Allowed | Blocked | Rationale |
+|---------|---------|---------|-----------|
+| **Gmail** | `drafts create/update/delete`, `labels *`, `archive`, `mark-read`, `unread`, `trash`, `batch modify` | `send`, `drafts send`, `batch delete` | Drafts + inbox management only |
+| **Calendar** | `create`, `update`, `delete`, `focus-time`, `ooo`, `working-location` | `respond` | Creating/editing your own events is fine; RSVP notifies the organizer |
+| **Chat** | — | `messages send`, `dm send`, `spaces create` | All chat writes are outbound |
+| **Drive** | `upload`, `mkdir`, `copy`, `move`, `rename`, `delete` | `share`, `comments create/reply` | Manage your own files; sharing/commenting reaches others |
+| **Docs** | `create`, `copy`, `write`, `insert`, `delete`, `update`, `edit`, `clear` | `comments add/reply` | Edit your own docs; comments notify collaborators |
+| **Slides** | `create`, `copy`, `create-from-markdown`, `add-slide`, `delete-slide`, `update-notes`, `replace-slide` | — | All self-contained |
+| **Sheets** | `create`, `copy`, `update`, `append`, `insert`, `clear`, `format` | — | All self-contained |
+| **Contacts** | `create`, `update`, `delete` | — | Address book is private |
+| **Tasks** | `add`, `update`, `done`, `undo`, `delete`, `clear`, `lists create` | — | Personal todo list |
+| **Forms** | `create` | — | Self-contained |
+| **AppScript** | `create` | `run` | Creating is safe; running executes arbitrary code |
+| **Gmail Settings** | — | `filters create/delete`, `delegates add/remove`, `forwarding create/delete`, `autoforward update`, `sendas create/delete/update/verify`, `vacation update`, `watch *` | Settings changes can have outbound side effects (forwarding, auto-replies, delegates) |
 
-| Service | Write operations | Blocked? |
-|---------|-----------------|----------|
-| **Calendar** | `create`, `update`, `delete`, `respond`, `focus-time`, `ooo`, `working-location` | ❌ Allowed |
-| **Drive** | `upload`, `mkdir`, `delete`, `move`, `unshare`, `comments create/reply` | ❌ Allowed |
-| **Docs** | `create`, `write`, `insert`, `delete`, `update`, `edit`, `comments add/reply` | ❌ Allowed |
-| **Slides** | `create`, `add-slide`, `delete-slide`, `update-notes` | ❌ Allowed |
-| **Sheets** | `create`, `update`, `append`, `insert` | ❌ Allowed |
-| **Contacts** | `create`, `update`, `delete` | ❌ Allowed |
-| **Tasks** | `add`, `update`, `delete`, `lists create` | ❌ Allowed |
-| **Forms** | `create` | ❌ Allowed |
-| **Keep** | (read-only in gog) | N/A |
-| **Groups** | (read-only in gog) | N/A |
+### Level 2: Draft & Collaborate
 
-### Edge cases to discuss
+Everything in Level 1, **plus** collaborative actions within shared workspaces. Still no direct messaging.
 
-| Command | Outbound? | Decision |
-|---------|-----------|----------|
-| `calendar respond` (RSVP) | Sends notification to organizer | **Allow** — it's a response to something sent to you, not an unsolicited outbound message |
-| `drive comments create/reply` | Visible to collaborators | **Allow** — comments are within a shared workspace context, not direct messaging |
-| `docs comments add/reply` | Same as drive comments | **Allow** |
-| `gmail autoforward update` | Could silently redirect mail | **TBD** — could argue this is a "send" in disguise |
-| `gmail delegates add` | Grants mailbox access to someone | **TBD** — not a "send" but is a security-sensitive outbound action |
-| `gmail filters create` (with forward) | Could auto-forward mail | **TBD** — same concern as autoforward |
+| Service | Added from Level 1 | Still blocked |
+|---------|-------------------|---------------|
+| **Calendar** | `respond` (RSVP) | — |
+| **Drive** | `share`, `unshare`, `comments create/update/delete/reply` | — |
+| **Docs** | `comments add/reply/resolve/delete` | — |
+| **Gmail Settings** | `filters create/delete`, `vacation update` | `delegates add/remove`, `forwarding create/delete`, `autoforward update`, `sendas *`, `watch *` |
+| **AppScript** | `run` | — |
 
-## Design
+### Level 3: Full Write (No Admin)
 
-### 1. Flag: `--no-send`
+Everything in Level 2, **plus** direct messaging. The only things blocked are destructive admin/settings operations.
 
-New root-level flag on `RootFlags`:
+| Service | Added from Level 2 | Still blocked |
+|---------|-------------------|---------------|
+| **Gmail** | `send`, `drafts send` | `batch delete` (permanent delete) |
+| **Chat** | `messages send`, `dm send`, `spaces create` | — |
+| **Gmail Settings** | `sendas *` | `delegates add/remove`, `forwarding create/delete`, `autoforward update`, `watch *` |
 
-```go
-type RootFlags struct {
-    // ...existing flags...
-    NoSend bool `name:"no-send" help:"Block outbound message commands (send email, send chat); drafts and all other writes allowed" default:"${no_send}"`
-}
+### Level 4: Unrestricted
+
+All operations allowed. No CLI-level blocking. This is the current default behavior.
+
+---
+
+## Summary Matrix
+
+| Command | L0 | L1 | L2 | L3 | L4 |
+|---------|:--:|:--:|:--:|:--:|:--:|
+| **Gmail** | | | | | |
+| `gmail search/get/messages/thread/attachment/url/history` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `gmail labels *` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `gmail archive/mark-read/unread/trash` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `gmail batch modify` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `gmail drafts create/update/delete/list/get` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `gmail send` / `gmail drafts send` / `send` | ❌ | ❌ | ❌ | ✅ | ✅ |
+| `gmail batch delete` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `gmail track *` | ❌ | ❌ | ❌ | ✅ | ✅ |
+| `gmail settings filters *` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| `gmail settings vacation *` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| `gmail settings sendas *` | ❌ | ❌ | ❌ | ✅ | ✅ |
+| `gmail settings delegates *` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `gmail settings forwarding *` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `gmail settings autoforward *` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `gmail settings watch *` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Calendar** | | | | | |
+| `calendar events/list/get/free-busy/calendars` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `calendar create/update/delete/focus-time/ooo/working-location` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `calendar respond` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Chat** | | | | | |
+| `chat spaces list/get`, `chat messages list/get`, `chat dm list` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `chat messages send`, `chat dm send` | ❌ | ❌ | ❌ | ✅ | ✅ |
+| `chat spaces create` | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **Drive** | | | | | |
+| `drive ls/search/get/download/info/permissions` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `drive upload/mkdir/copy/move/rename/delete` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `drive share/unshare` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| `drive comments *` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Docs** | | | | | |
+| `docs get/export/list` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `docs create/copy/write/insert/delete/update/edit/clear` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `docs comments *` | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Slides** | | | | | |
+| `slides get/export/list` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `slides create/copy/add-slide/delete-slide/update-notes/replace-slide/create-from-markdown` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Sheets** | | | | | |
+| `sheets get/export/list/read` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `sheets create/copy/update/append/insert/clear/format` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Contacts** | | | | | |
+| `contacts list/get/search/directory/other` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `contacts create/update/delete` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Tasks** | | | | | |
+| `tasks list/get` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `tasks add/update/done/undo/delete/clear/lists create` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Forms** | | | | | |
+| `forms get/responses` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `forms create` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **AppScript** | | | | | |
+| `appscript list/get` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `appscript create` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| `appscript run` | ❌ | ❌ | ✅ | ✅ | ✅ |
+
+## UX
+
+### Flag
+
+```bash
+# Set via flag
+gog --safety-level 1 gmail send --to ...
+# Error: "gmail send" is blocked at safety level 1 (draft-and-organize).
+# Tip: use "gmail drafts create" to create a draft instead.
+# To allow sending, use --safety-level 3 or higher.
+
+# Set via env var (recommended for agents)
+export GOG_SAFETY_LEVEL=1
 ```
 
-Environment variable: `GOG_NO_SEND=true`
+### Per-service overrides
 
-### 2. Enforcement point
+For advanced use — override individual services regardless of the base level:
 
-Single check function called early in `Run()`, similar to `enforceEnabledCommands`:
+```bash
+# Level 1 base, but allow sending chat messages
+export GOG_SAFETY_LEVEL=1
+export GOG_ALLOW="chat.messages.send,chat.dm.send"
 
-```go
-func enforceNoSend(kctx *kong.Context, noSend bool) error {
-    if !noSend {
-        return nil
-    }
-    // Check if current command path matches a blocked command
-    // Return clear error: "blocked by --no-send: use 'gmail drafts create' instead"
-}
+# Level 3 base, but block drive share
+export GOG_SAFETY_LEVEL=3
+export GOG_BLOCK="drive.share"
 ```
 
-Blocked command paths:
-- `gmail send`
-- `gmail drafts send`
-- `send` (top-level alias)
-- `chat messages send`
-- `chat dm send`
+### Status display
 
-### 3. Error message
+```bash
+$ gog status
+Account:      user@gmail.com
+Safety level: 1 (draft-and-organize)
+Overrides:    +chat.messages.send, +chat.dm.send
+```
 
-When blocked:
+### Error messages
+
+Blocked commands should give actionable guidance:
 
 ```
-Error: command "gmail send" is blocked by --no-send mode
+Error: "gmail send" is blocked at safety level 1 (draft-and-organize)
 
-To create a draft instead:
+Create a draft instead:
   gog gmail drafts create --to user@example.com --subject "..." --body "..."
 
-To disable this restriction, remove --no-send or unset GOG_NO_SEND.
+The draft will appear in the user's Gmail drafts folder for manual review and sending.
+To change the safety level: --safety-level=<0-4> or GOG_SAFETY_LEVEL=<0-4>
 ```
 
-### 4. Dry-run integration
+## Level Names
 
-When `--no-send` is active and `--dry-run` is also set, the dry-run output should note that the command would be blocked even without `--dry-run`.
+| Level | Numeric | Name | One-liner |
+|-------|---------|------|-----------|
+| 0 | `0` | `readonly` | Read everything, write nothing |
+| 1 | `1` | `draft` | Draft, organize, edit your own stuff — nothing outbound |
+| 2 | `2` | `collaborate` | Level 1 + comments, sharing, RSVP — collaborative but no messaging |
+| 3 | `3` | `standard` | Full write + messaging — no dangerous admin operations |
+| 4 | `4` | `unrestricted` | Everything allowed |
 
-### 5. Status output
-
-`gog auth status` / `gog status` should show when `--no-send` is active so operators can verify the guardrail is on.
+Levels can be referenced by number or name: `--safety-level=draft` or `--safety-level=1`.
 
 ## Implementation Plan
 
-### Task 1: Add `--no-send` flag to RootFlags
-- Add field to `RootFlags` struct in `root.go`
-- Add `GOG_NO_SEND` env var in kong vars
-- Wire up in `Run()`
+### Task 1: Define safety level types and blocked command registry
+- Create `internal/cmd/safety_levels.go`
+- Define level enum and per-level blocked command paths
+- Pattern matching for command paths (e.g., `gmail.settings.*` blocks all settings subcommands)
 
-### Task 2: Create `enforce_no_send.go`
-- Implement `enforceNoSend()` with blocked command list
-- Call from `Run()` after `enforceEnabledCommands`
-- Clear error messages with suggested alternatives
+### Task 2: Add `--safety-level` flag and env var
+- Add to `RootFlags` in `root.go`
+- Add `GOG_SAFETY_LEVEL` env var
+- Add `GOG_ALLOW` and `GOG_BLOCK` for per-service overrides
+- Wire into `Run()` after `enforceEnabledCommands`
 
-### Task 3: Status display
-- Show `no-send: active` in `gog status` / `gog auth status` output
-- Show in dry-run output
+### Task 3: Enforcement function
+- `enforceSafetyLevel(kctx, level, allow, block)` 
+- Match full command path against blocked list for the active level
+- Apply allow/block overrides
+- Return clear error with alternative suggestion
 
-### Task 4: Tests
-- Unit tests for `enforceNoSend()` with each blocked command
-- Unit tests confirming allowed commands pass through
-- Integration with `--dry-run`
+### Task 4: Status display
+- Show safety level and overrides in `gog status` / `gog auth status`
+- Show in `--dry-run` output
+- Show in `--verbose` output
 
-### Task 5: Documentation
-- Update README/help text
-- Add to agent mode docs
+### Task 5: Tests
+- Unit tests for each level with each blocked/allowed command
+- Override tests (GOG_ALLOW / GOG_BLOCK)
+- Edge cases: command aliases, top-level shortcuts (`send`, `upload`, etc.)
+
+### Task 6: Documentation
+- README section on safety levels
+- Agent mode setup guide
+- Update `gog auth add` help text to mention safety levels
 
 ## Open Questions
 
-1. **Should `calendar respond` be blocked?** It notifies the organizer. Current proposal: allow.
-2. **Should `gmail autoforward`, `gmail delegates`, `gmail filters` (with forward action) be blocked?** These are indirect "send" operations. Could be a separate `--no-send-strict` mode or included in v1.
-3. **Should this be per-account or global?** Current proposal: global flag/env var. Per-account would require storing in config or keyring metadata.
-4. **Name bikeshed:** `--no-send` vs `--drafts-only` vs `--safe-write` vs `--block-send`? `--no-send` is most explicit about what it does.
+1. **Default level for new installs?** Currently effectively level 4. Should we change the default? Probably not — backward compatibility.
+2. **Should `--safety-level` be storable in config.json?** Per-account safety levels would let you have one account at level 1 (agent) and another at level 4 (personal). Adds complexity.
+3. **Interaction with `--readonly`?** `--readonly` should be equivalent to / alias for `--safety-level=0`. If both are set, take the more restrictive.
+4. **Should `--enable-commands` and `--safety-level` compose?** Both must pass for a command to run. They're orthogonal: `--enable-commands` restricts which services, `--safety-level` restricts what you can do within allowed services.
